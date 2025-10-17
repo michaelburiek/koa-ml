@@ -1,0 +1,19 @@
+# Evaluation config for Qwen3-VL on the M2SV dataset
+
+model:
+  model_name: "Qwen/Qwen3-VL-30B-A3B-Thinking"
+  dtype: "float16"
+  device_map: "auto"
+
+dataset:
+  name: "yosubshin/m2sv"
+  split: "validation"
+
+generation:
+  max_new_tokens: 1024
+  temperature: 0.1
+  limit:
+
+output:
+  dir: "./eval_results/qwen3_vl_30b_a3b_thinking_m2sv_20251017_v2"
+  save_predictions: true

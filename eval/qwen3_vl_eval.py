@@ -23,6 +23,7 @@ from datasets import Dataset, load_dataset
 from PIL import Image
 from tqdm.auto import tqdm
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+import re
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -93,19 +94,114 @@ def safe_load_image(image_obj: Any) -> Optional[Image.Image]:
 
 
 def format_prompt(question: str, options: List[str]) -> str:
-    prompt_lines = [question, "", "Options:"]
-    prompt_lines.extend(options)
-    prompt_lines.append("")
-    prompt_lines.append("Provide only the letter of the correct answer (A, B, C, or D).")
+    system_prompt = "You will be given two images concatenated side by side: (1) a north-up overhead map with arrows labeled A, B, C, ... and (2) a street-view photo.\nRules:\n- The camera location is the same for all options: the center of the intersection.\n- Each letter corresponds to facing outward from that center along the arrow of that label.\n- The small circles near labels are markers only; they are not camera locations.\n- The map and photo may be captured years apart. Ignore transient objects (cars, people).\nThink step by step to compare the street-view with the map (buildings, angles, lanes, landmarks).\nOn the final line, output only: Final answer: \\boxed{X} where X is a single letter (A, B, C, ...)."
+    prompt_lines = [system_prompt, question]
     return "\n".join(prompt_lines)
 
 
-def extract_answer(response: str) -> str:
-    response = response.strip().upper()
-    for char in ("A", "B", "C", "D"):
-        if char in response:
-            return char
-    return response[0] if response else ""
+def normalize_letter(text: str, num_options: int) -> str:
+    """Return a single option letter if confidently present.
+
+    Priority:
+    1) Exact single-letter response (ignoring surrounding whitespace).
+    2) Letter inside \boxed{X} (case-insensitive).
+    3) Explicit conclusion phrases like "answer is X" or "final answer: X" (also supports "is:").
+    4) Last non-empty line is effectively just a styled single letter (e.g., **B**, (C), `A`, "C.").
+    5) As a weaker fallback, accept phrases like "choose X", "option X", "arrow X" unless preceded by elimination/negation context.
+    Otherwise returns empty string to avoid false positives from prose.
+    """
+    if text is None:
+        return ""
+    t = text.strip()
+    if not t:
+        return ""
+
+    def is_valid_letter(ch: str) -> str:
+        if not ch:
+            return ""
+        ch_u = ch.upper()
+        idx = ord(ch_u) - ord("A")
+        return ch_u if 0 <= idx < num_options else ""
+
+    # 1) Exact single letter
+    m = re.fullmatch(r"\s*([A-Za-z])\s*", t)
+    if m:
+        ch = is_valid_letter(m.group(1))
+        if ch:
+            return ch
+
+    # 2) \boxed{X}
+    m = re.search(r"\\boxed\{\s*([A-Za-z])\s*\}", t, flags=re.IGNORECASE)
+    if m:
+        ch = is_valid_letter(m.group(1))
+        if ch:
+            return ch
+
+    # 2b) Repeated-letter outputs like "C. C" or "B B" as the entire response
+    m = re.fullmatch(r"\s*([A-Za-z])\s*[\.-:;,]?\s*\1\s*\.?\s*", t)
+    if m:
+        ch = is_valid_letter(m.group(1))
+        if ch:
+            return ch
+
+    # 3) Prefer explicit conclusion phrases anywhere in text (prefer the last such mention)
+    explicit_answer_patterns = [
+        r"(?:\bthe\s+answer\b|\banswer\b)\s*(?:is\s*[:=]?|[:=])\s*([A-Za-z])\b",
+        r"\bfinal\s*(?:answer)?\s*(?:is\s*[:=]?|[:=])\s*([A-Za-z])\b",
+    ]
+    explicit_candidates: list[str] = []
+    for pat in explicit_answer_patterns:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            explicit_candidates.append(m.group(1))
+    for raw in reversed(explicit_candidates):
+        ch = is_valid_letter(raw)
+        if ch:
+            return ch
+
+    # 4) Last non-empty line: accept if it's effectively just a single styled letter
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if lines:
+        last = lines[-1]
+        # If the last line itself contains an explicit phrase, re-use explicit logic on it for precision
+        for pat in explicit_answer_patterns:
+            m2 = re.search(pat, last, flags=re.IGNORECASE)
+            if m2:
+                ch = is_valid_letter(m2.group(1))
+                if ch:
+                    return ch
+        # Repeated-letter on last line like "C. C"
+        mrep = re.fullmatch(r"\s*([A-Za-z])\s*[\.-:;,]?\s*\1\s*\.?\s*", last)
+        if mrep:
+            ch = is_valid_letter(mrep.group(1))
+            if ch:
+                return ch
+        # Strip typical wrappers and styling around a lone letter
+        stripped = re.sub(r"[\s\*`_~\-–—\(\)\[\]\{\}\"'.:;,!]+", "", last)
+        # If what's left is a single letter, accept it
+        if re.fullmatch(r"[A-Za-z]", stripped):
+            ch = is_valid_letter(stripped)
+            if ch:
+                return ch
+
+    # 5) Weaker fallback: ambiguous phrases choose/option/arrow X, but avoid elimination contexts
+    ambiguous_patterns = [
+        r"\bchoose\s*([A-Za-z])\b",
+        r"\b(?:option|choice|arrow)\s*([A-Za-z])\b",
+    ]
+    last_ch = ""
+    for pat in ambiguous_patterns:
+        for m in re.finditer(pat, t, flags=re.IGNORECASE):
+            start = m.start()
+            context = t[max(0, start-50):start].lower()
+            if any(neg in context for neg in ["eliminate", "eliminates", "eliminated", "eliminating", "not ", "isn't", "is not", "avoid", "eliminates option", "eliminate option"]):
+                continue
+            ch = is_valid_letter(m.group(1))
+            if ch:
+                last_ch = ch
+    if last_ch:
+        return last_ch
+
+    return ""
 
 
 def evaluate(cfg: EvalConfig) -> Dict[str, Any]:
@@ -182,7 +278,7 @@ def evaluate(cfg: EvalConfig) -> Dict[str, Any]:
                 clean_up_tokenization_spaces=False,
             )[0]
 
-            prediction = extract_answer(response)
+            prediction = normalize_letter(response, len(item["options"]))
             ground_truth = item["answer"]
             is_correct = prediction == ground_truth
 
